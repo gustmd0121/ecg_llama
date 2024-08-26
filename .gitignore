@@ -1,0 +1,10 @@
+model_checkpoints/
+src/model_checkpoints/
+wandb/
+*.sh
+*.ipynb
+*.txt
+*.pyc
+*.pt
+evaluation/
+ecg_clip_model/
