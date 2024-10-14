@@ -13,9 +13,9 @@ def merge_lora(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=str, required=True)
-    parser.add_argument("--model-base", type=str, required=True)
-    parser.add_argument("--save-model-path", type=str, required=True)
+    parser.add_argument("--model-path", type=str, default="/home/hschung/LLaVA-NeXT/checkpoints/llava-llama_3.1_8b_instruct_ecg_images_with_eval_paraphrased/checkpoint-2142")
+    parser.add_argument("--model-base", type=str, default="meta-llama/Meta-Llama-3.1-8B-Instruct")
+    parser.add_argument("--save-model-path", type=str, default="/home/hschung/LLaVA-NeXT/checkpoints/merge_with_eval_paraphrased")
 
     args = parser.parse_args()
 

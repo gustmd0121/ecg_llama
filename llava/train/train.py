@@ -132,6 +132,7 @@ class DataArguments:
     frames_upbound: Optional[int] = field(default=0)
     add_time_instruction: Optional[bool] = field(default=False)
     force_sample: Optional[bool] = field(default=False)
+    validation_data_path: Optional[str] = field(default=None)
 
 
 @dataclass
@@ -957,82 +958,106 @@ class LazySupervisedDataset(Dataset):
         super(LazySupervisedDataset, self).__init__()
         self.tokenizer = tokenizer
         self.list_data_dict = []
-
-        # Handle multiple JSON files specified in the data_path
-        if "{" in data_path and "}" in data_path:
-            base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.json$", data_path).groups()
-            file_names = file_pattern.split(",")
-            rank0_print(f"Loading {file_names} from {base_path}")
-            data_args.dataset_paths = []
-            for file_name in file_names:
-                data_args.dataset_paths.append(f"{base_path}{file_name}.json")
-                full_path = f"{base_path}{file_name}.json"
-                rank0_print(f"Loading {full_path}")
-                with open(full_path, "r") as file:
-                    cur_data_dict = json.load(file)
-                    rank0_print(f"Loaded {len(cur_data_dict)} samples from {full_path}")
-                    self.list_data_dict.extend(cur_data_dict)
-        elif data_path.endswith(".yaml"):
-            with open(data_path, "r") as file:
-                yaml_data = yaml.safe_load(file)
-                datasets = yaml_data.get("datasets")
-                # file should be in the format of:
-                # datasets:
-                #   - json_path: xxxx1.json
-                #     sampling_strategy: first:1000
-                #   - json_path: xxxx2.json
-                #     sampling_strategy: end:3000
-                #   - json_path: xxxx3.json
-                #     sampling_strategy: random:999
-                data_args.dataset_paths = [dataset.get("json_path") for dataset in datasets]
-                for dataset in datasets:
-                    json_path = dataset.get("json_path")
-                    sampling_strategy = dataset.get("sampling_strategy", "all")
-                    sampling_number = None
-
-                    rank0_print(f"Loading {json_path} with {sampling_strategy} sampling strategy")
-
-                    if json_path.endswith(".jsonl"):
-                        cur_data_dict = []
-                        with open(json_path, "r") as json_file:
-                            for line in json_file:
-                                cur_data_dict.append(json.loads(line.strip()))
-                    elif json_path.endswith(".json"):
-                        with open(json_path, "r") as json_file:
-                            cur_data_dict = json.load(json_file)
-                    else:
-                        raise ValueError(f"Unsupported file type: {json_path}")
-
-                    if ":" in sampling_strategy:
-                        sampling_strategy, sampling_number = sampling_strategy.split(":")
-                        if "%" in sampling_number:
-                            sampling_number = math.ceil(int(sampling_number.split("%")[0]) * len(cur_data_dict) / 100)
-                        else:
-                            sampling_number = int(sampling_number)
-
-                    # Apply the sampling strategy
-                    if sampling_strategy == "first" and sampling_number is not None:
-                        cur_data_dict = cur_data_dict[:sampling_number]
-                    elif sampling_strategy == "end" and sampling_number is not None:
-                        cur_data_dict = cur_data_dict[-sampling_number:]
-                    elif sampling_strategy == "random" and sampling_number is not None:
-                        random.shuffle(cur_data_dict)
-                        cur_data_dict = cur_data_dict[:sampling_number]
-
-                    rank0_print(f"Loaded {len(cur_data_dict)} samples from {json_path}")
-                    self.list_data_dict.extend(cur_data_dict)
-        else:
-            data_args.dataset_paths = [data_path]
-            rank0_print(f"Loading {data_path}")
-            with open(data_path, "r") as file:
-                cur_data_dict = json.load(file)
-                rank0_print(f"Loaded {len(cur_data_dict)} samples from {data_path}")
-                self.list_data_dict.extend(cur_data_dict)
-
-        rank0_print(f"Loaded {len(self.list_data_dict)} samples from {data_path}")
-        rank0_print("Formatting inputs...Skip in lazy mode")
-        self.tokenizer = tokenizer
         self.data_args = data_args
+
+        # Handle multiple data paths
+        data_paths = data_path.split(',') if ',' in data_path else [data_path]
+        data_args.dataset_paths = []
+
+        for path in data_paths:
+            path = path.strip()
+            if "{" in path and "}" in path:
+                self._load_multiple_json_files(path, data_args)
+            elif os.path.isdir(path):
+                self._load_json_files_from_directory(path, data_args)
+            elif path.endswith(".yaml"):
+                self._load_from_yaml(path, data_args)
+            else:
+                self._load_single_json_file(path, data_args)
+
+        rank0_print(f"Loaded a total of {len(self.list_data_dict)} samples from all data paths")
+        rank0_print("Formatting inputs...Skip in lazy mode")
+
+    def _load_multiple_json_files(self, path, data_args):
+        base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.json$", path).groups()
+        file_names = file_pattern.split(",")
+        rank0_print(f"Loading {file_names} from {base_path}")
+        for file_name in file_names:
+            full_path = f"{base_path}{file_name}.json"
+            data_args.dataset_paths.append(full_path)
+            self._load_json_file(full_path)
+
+    def _load_json_files_from_directory(self, path, data_args):
+        json_files = [f for f in os.listdir(path) if f.endswith('.json')]
+        rank0_print(f"Loading {len(json_files)} JSON files from {path}")
+        for json_file in json_files:
+            full_path = os.path.join(path, json_file)
+            data_args.dataset_paths.append(full_path)
+            self._load_json_file(full_path)
+
+    def _load_from_yaml(self, path, data_args):
+        with open(path, "r") as file:
+            yaml_data = yaml.safe_load(file)
+            datasets = yaml_data.get("datasets")
+            for dataset in datasets:
+                json_path = dataset.get("json_path")
+                data_args.dataset_paths.append(json_path)
+                sampling_strategy = dataset.get("sampling_strategy", "all")
+                self._load_and_sample_data(json_path, sampling_strategy)
+
+    def _load_single_json_file(self, path, data_args):
+        data_args.dataset_paths.append(path)
+        self._load_json_file(path)
+
+    def _load_json_file(self, path):
+        rank0_print(f"Loading {path}")
+        with open(path, "r") as file:
+            cur_data_dict = json.load(file)
+            rank0_print(f"Loaded {len(cur_data_dict)} samples from {path}")
+            self.list_data_dict.extend(cur_data_dict)
+
+    def _load_and_sample_data(self, json_path, sampling_strategy):
+        rank0_print(f"Loading {json_path} with {sampling_strategy} sampling strategy")
+        if json_path.endswith(".jsonl"):
+            cur_data_dict = self._load_jsonl(json_path)
+        elif json_path.endswith(".json"):
+            cur_data_dict = self._load_json(json_path)
+        else:
+            raise ValueError(f"Unsupported file type: {json_path}")
+
+        cur_data_dict = self._apply_sampling_strategy(cur_data_dict, sampling_strategy)
+        rank0_print(f"Loaded {len(cur_data_dict)} samples from {json_path}")
+        self.list_data_dict.extend(cur_data_dict)
+
+    def _load_jsonl(self, path):
+        data = []
+        with open(path, "r") as file:
+            for line in file:
+                data.append(json.loads(line.strip()))
+        return data
+
+    def _load_json(self, path):
+        with open(path, "r") as file:
+            return json.load(file)
+
+    def _apply_sampling_strategy(self, data, strategy):
+        if ":" not in strategy:
+            return data
+        strategy, number = strategy.split(":")
+        if "%" in number:
+            number = math.ceil(int(number.split("%")[0]) * len(data) / 100)
+        else:
+            number = int(number)
+
+        if strategy == "first":
+            return data[:number]
+        elif strategy == "end":
+            return data[-number:]
+        elif strategy == "random":
+            random.shuffle(data)
+            return data[:number]
+        else:
+            return data
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -1289,8 +1314,9 @@ class DataCollatorForSupervisedDataset(object):
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, data_args=data_args)
+    eval_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.validation_data_path, data_args=data_args)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
 
 
 def get_model(model_args, training_args, bnb_model_from_pretrained_args):
@@ -1398,7 +1424,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 cache_dir=training_args.cache_dir,
                 attn_implementation=training_args.attn_implementation,
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                low_cpu_mem_usage=False,
+                low_cpu_mem_usage=True,
                 **customized_kwargs,
             )
         elif "qwen" in model_args.model_name_or_path.lower():
@@ -1469,8 +1495,6 @@ def train(attn_implementation=None):
         bnb_model_from_pretrained_args.update(
             dict(
                 device_map={"": training_args.device},
-                load_in_4bit=training_args.bits == 4,
-                load_in_8bit=training_args.bits == 8,
                 quantization_config=BitsAndBytesConfig(
                     load_in_4bit=training_args.bits == 4,
                     load_in_8bit=training_args.bits == 8,
@@ -1560,14 +1584,14 @@ def train(attn_implementation=None):
     elif model_args.version == "v0.5":
         tokenizer.pad_token = tokenizer.unk_token
     else:
-        if tokenizer.unk_token is not None:
+        if tokenizer.unk_token is not None: 
             tokenizer.pad_token = tokenizer.unk_token
-        if model_args.version in conversation_lib.conv_templates:
+        if model_args.version in conversation_lib.conv_templates: #llava_llama_3
             conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
-    if model_args.vision_tower is not None:
+    if model_args.vision_tower is not None: #clip vit large patch 14 336
         model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
 
         vision_tower = model.get_vision_tower()
@@ -1621,17 +1645,17 @@ def train(attn_implementation=None):
                 for p in model.get_model().vision_resampler.parameters():
                     p.requires_grad = True
 
-            model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
+            model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter #freeze projector
             if training_args.freeze_mm_mlp_adapter:
                 for p in model.get_model().mm_projector.parameters():
                     p.requires_grad = False
 
-            model.config.freeze_mm_vision_resampler = training_args.freeze_mm_vision_resampler
+            model.config.freeze_mm_vision_resampler = training_args.freeze_mm_vision_resampler #freeze resampler
             if training_args.freeze_mm_vision_resampler:
                 for p in model.get_model().vision_resampler.parameters():
                     p.requires_grad = False
 
-            model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower
+            model.config.unfreeze_mm_vision_tower = model_args.unfreeze_mm_vision_tower #unfreeze clip vit
             if model_args.unfreeze_mm_vision_tower:
                 vision_tower.requires_grad_(True)
             else:
@@ -1660,7 +1684,10 @@ def train(attn_implementation=None):
             if "mm_language_model" in tunable_parts:
                 for name, param in model.named_parameters():
                     if "vision_tower" not in name and "mm_projector" not in name and "vision_resampler" not in name:
-                        param.requires_grad_(True)
+                        if param.dtype in [torch.float32, torch.float16, torch.bfloat16]:
+                            param.requires_grad_(True)
+                        else:
+                            param.requires_grad_(False)
 
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)

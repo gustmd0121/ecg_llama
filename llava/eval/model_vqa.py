@@ -15,7 +15,7 @@ from llava.constants import IGNORE_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_
 from typing import Dict, Optional, Sequence, List
 import transformers
 import re
-
+from transformers import AutoConfig
 from PIL import Image
 import math
 
@@ -85,11 +85,18 @@ def preprocess_qwen(sources, tokenizer: transformers.PreTrainedTokenizer, has_im
 
 def eval_model(args):
     
+    # Load the custom config
+    custom_config_path = "/home/hschung/LLaVA-NeXT/checkpoints/llava-llama_3.1_8b_instruct_ecg_images_with_eval_paraphrased/checkpoint-2142-lora/config.json"
+    with open(custom_config_path, 'r') as f:
+        custom_config = json.load(f) 
+
+    overwrite_config = {'tie_word_embeddings': False, 'use_cache': True, "vocab_size": 32000}
+
     # Model
     disable_torch_init()
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
-    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
+    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name, overwrite_config=custom_config)
 
     # Data
     with open(os.path.expanduser(args.question_file)) as f:
