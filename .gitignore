@@ -174,3 +174,6 @@ data/preprocessed/*.pkl
 model_checkpoints/*.pt
 **/*.pt
 **/**/*.pt
+src/model_checkpoints/
+ckpts/
+

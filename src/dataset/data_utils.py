@@ -5,8 +5,8 @@ import transformers
 from packaging import version
 IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse('0.14')
 
-from constants import IGNORE_INDEX, IMAGE_TOKEN, PAD_TOKEN
-from llava_conversation_lib import conv_templates, SeparatorStyle
+from utils.constants import IGNORE_INDEX, IMAGE_TOKEN, PAD_TOKEN
+from utils.llava_conversation_lib import conv_templates, SeparatorStyle
 
 
 def tokenizer_image_token(prompt, tokenizer, return_tensors=None):

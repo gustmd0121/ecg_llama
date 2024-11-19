@@ -1,35 +1,69 @@
+import os
 from typing import Optional, List, Union, Tuple
 import torch
 from peft import LoraConfig, get_peft_model
 from torch import nn
 from transformers import AutoModel, AutoModelForCausalLM, Cache, PreTrainedModel, BitsAndBytesConfig
+from transformers.generation.utils import GenerationMixin
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
 
-from configuration_llama import MultimodalLlamaConfig
-from multimodal_projector import MultiModalLlamaProjector
+from model.configuration_llama import MultimodalLlamaConfig
+from model.multimodal_projector import MultiModalLlamaProjector
 
+from fairseq_signals.models import build_model_from_checkpoint
 
-class MultimodalLlamaForConditionalGeneration(PreTrainedModel):
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class MultimodalLlamaForConditionalGeneration(PreTrainedModel, GenerationMixin):
     config_class = MultimodalLlamaConfig
     supports_gradient_checkpointing = True
 
     def __init__(self, config: MultimodalLlamaConfig):
         super().__init__(config)
 
+        # Get model dtype first
+        self.model_dtype = torch.float32 if config.load_in_8bit else torch.bfloat16
+        
         self.config = config
+        # Change from (16, 1, 1024) to (1, 1024) - single separator vector
+        self.sep_embedding = nn.Parameter(torch.zeros(1, self.config.vision_config['hidden_size'], dtype=self.model_dtype))
 
-        # Instantiate the models for text and vision
-        self.language_model = AutoModelForCausalLM.from_pretrained(config.text_model_id,
-                                                                   resume_download=True,
-                                                                   torch_dtype=torch.bfloat16,
-                                                                   quantization_config=BitsAndBytesConfig(load_in_4bit=True) if config.load_in_4bit else None,
-                                                                   attn_implementation="flash_attention_2",
-                                                                   )
-        self.vision_model = AutoModel.from_pretrained(config.vision_model_id)
+        # Configure quantization
+        quantization_config = None
+        if config.load_in_8bit:
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_threshold=6.0
+            )
 
-        # Keep only vision model's encoder if using CLIP
-        if "clip" in self.config.vision_model_id:
-            self.vision_model = self.vision_model.vision_model
+        # Set device map based on local rank
+        if config.local_rank != -1:
+            device_map = {"": config.local_rank}
+        else:
+            device_map = "auto" if config.load_in_8bit else None
+
+        # Instantiate models with proper dtype
+        self.language_model = AutoModelForCausalLM.from_pretrained(
+            config.text_model_id,
+            resume_download=True,
+            torch_dtype=self.model_dtype,
+            quantization_config=quantization_config,
+            attn_implementation="flash_attention_2",
+        ).to(device)
+        
+        
+        if config.data_type == "image":
+            self.vision_model = AutoModel.from_pretrained(
+                config.vision_model_id
+            ).to(config.device).to(self.model_dtype)
+
+            # Keep only vision model's encoder if using CLIP
+            if "clip" in self.config.vision_model_id:
+                self.vision_model = self.vision_model.vision_model
+        elif config.data_type == "signal":
+            self.vision_model = build_model_from_checkpoint(
+                '/home/hschung/ecg-llm/llama-multimodal-vqa/ckpts/mimic_iv_ecg_physionet_pretrained.pt'
+            ).to(config.device).to(self.model_dtype)
 
         # Instantiate the multimodal projector
         self.vocab_size = self.config.text_config.vocab_size
@@ -73,6 +107,7 @@ class MultimodalLlamaForConditionalGeneration(PreTrainedModel):
             self.language_model.print_trainable_parameters()
 
         if freeze_vision_model:
+            self.vision_model.training = False
             for p in self.vision_model.parameters():
                 p.requires_grad = False
 
@@ -96,6 +131,9 @@ class MultimodalLlamaForConditionalGeneration(PreTrainedModel):
         return model_embeds
 
     def _merge_input_ids_with_image_features(self, image_features, inputs_embeds, input_ids, attention_mask, labels):
+        # Convert image_features to match inputs_embeds dtype
+        image_features = image_features.to(dtype=inputs_embeds.dtype)
+        
         num_images, num_image_patches, embed_dim = image_features.shape
         batch_size, sequence_length = input_ids.shape
         left_padding = not torch.sum(input_ids[:, -1] == torch.tensor(self.config.pad_token_index))
@@ -119,7 +157,9 @@ class MultimodalLlamaForConditionalGeneration(PreTrainedModel):
 
         # 3. Create the full embedding, already padded to the maximum position
         final_embedding = torch.zeros(
-            batch_size, max_embed_dim, embed_dim, dtype=inputs_embeds.dtype, device=inputs_embeds.device
+            batch_size, max_embed_dim, embed_dim, 
+            dtype=inputs_embeds.dtype,  # Use same dtype as inputs_embeds
+            device=inputs_embeds.device
         )
         final_attention_mask = torch.zeros(
             batch_size, max_embed_dim, dtype=attention_mask.dtype, device=inputs_embeds.device
@@ -155,7 +195,12 @@ class MultimodalLlamaForConditionalGeneration(PreTrainedModel):
                 f" the number of image given to the model is {num_images}. This prevents correct indexing and breaks batch generation."
             )
 
-        final_embedding[image_to_overwrite] = image_features.contiguous().reshape(-1, embed_dim).to(target_device)
+        # Ensure dtype match before assignment
+        image_features_reshaped = image_features.contiguous().reshape(-1, embed_dim).to(
+            device=target_device, 
+            dtype=final_embedding.dtype
+        )
+        final_embedding[image_to_overwrite] = image_features_reshaped
         final_attention_mask |= image_to_overwrite
         position_ids = (final_attention_mask.cumsum(-1) - 1).masked_fill_((final_attention_mask == 0), 1)
 
@@ -174,6 +219,11 @@ class MultimodalLlamaForConditionalGeneration(PreTrainedModel):
         self,
         input_ids: torch.LongTensor = None,
         pixel_values: torch.FloatTensor = None,
+        images2: torch.FloatTensor = None,
+        ecg: torch.FloatTensor = None,
+        ecg2: torch.FloatTensor = None,
+        ecg_padding_mask: torch.BoolTensor = None,
+        ecg_padding_mask2: torch.BoolTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -230,64 +280,140 @@ class MultimodalLlamaForConditionalGeneration(PreTrainedModel):
             else self.config.vision_feature_select_strategy
         )
 
+        # Convert inputs to correct dtype
+        if pixel_values is not None:
+            pixel_values = pixel_values.to(self.model_dtype)
+            if images2 is not None:
+                images2 = images2.to(self.model_dtype)
+        
+        if ecg is not None:
+            ecg = ecg.to(self.model_dtype)
+            if ecg2 is not None:
+                ecg2 = ecg2.to(self.model_dtype)
+
+        if pixel_values is not None and pixel_values.shape[0] == 2:
+            images2 = pixel_values[1].unsqueeze(0)
+            pixel_values = pixel_values[0].unsqueeze(0)
+
         if inputs_embeds is None:
             # 1. Extra the input embeddings
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
             # 2. Merge text and images
             if pixel_values is not None and input_ids.shape[1] != 1:
+                # Ensure vision model outputs match language model dtype
                 image_outputs = self.vision_model(pixel_values, output_hidden_states=True)
-                # this is not memory efficient at all (output_hidden_states=True) will save all the hidden stated.
                 selected_image_feature = image_outputs.hidden_states[vision_feature_layer]
 
-                if vision_feature_select_strategy == "default":
-                    selected_image_feature = selected_image_feature[:, 1:]
-                elif vision_feature_select_strategy == "full":
-                    selected_image_feature = selected_image_feature
-                else:
-                    raise ValueError(
-                        f"Unexpected select feature strategy: {self.config.vision_feature_select_strategy}"
-                    )
+                # Check if images2 is not all zeros (presence of a second image)
+                images2_not_all_zeros = torch.any(images2 != 0, dim=(1, 2, 3))  # Convert to float for compatibility
 
-                image_features = self.multi_modal_projector(selected_image_feature)
+                # Process second images
+                image_outputs2 = self.vision_model(images2, output_hidden_states=True)
+                selected_image_feature2 = image_outputs2.hidden_states[vision_feature_layer]
+
+                # Create a presence mask for the second image features
+                presence_mask = images2_not_all_zeros.view(-1, 1, 1)  # [bs, 1, 1], same as zeros_mask before
+
+                # Use the mask to inform the model about second image presence
+                # Concatenate features with a separator embedding
+                batch_size = selected_image_feature.size(0)
+                sep_expanded = self.sep_embedding.unsqueeze(0).expand(batch_size, 1, -1)
+
+                # Concatenate along the sequence dimension
+                ecg_concat = torch.cat([
+                    selected_image_feature,
+                    sep_expanded,                  
+                    selected_image_feature2
+                ], dim=1)
+
+                # Incorporate the presence mask as an additional feature dimension
+                # Expand and append to the concatenated features
+                presence_mask_expanded = presence_mask.expand(-1, ecg_concat.size(1), 1)  # Expand to match concatenated feature shape
+                ecg_concat_with_mask = torch.cat([ecg_concat, presence_mask_expanded], dim=-1)  # Concatenate as a new feature dimension
+
+                # Pass concatenated features with the mask to the projector
+                image_features = self.multi_modal_projector(ecg_concat_with_mask)
                 inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
                     image_features, inputs_embeds, input_ids, attention_mask, labels
                 )
                 if labels is None:
                     labels = torch.full_like(attention_mask, self.config.ignore_index).to(torch.long)
+                    
+            elif ecg is not None and input_ids.shape[1] != 1:
+                # Ensure vision model outputs match language model dtype
+                ecg_outputs = self.vision_model.extract_features(ecg, padding_mask=ecg_padding_mask)
+                selected_ecg_feature = ecg_outputs['x']
+
+                # Check if ecg2 is not all zeros (presence of a second image)
+                ecg2_not_all_zeros = ~torch.all(ecg_padding_mask2, dim=(1, 2))  
+
+                # Process second images
+                ecg_outputs2 = self.vision_model.extract_features(ecg2, padding_mask=ecg_padding_mask2)
+                selected_ecg_feature2 = ecg_outputs2['x']
+
+                # Create a presence mask for the second image features
+                presence_mask = ecg2_not_all_zeros.view(-1, 1, 1)  # [bs, 1, 1], same as zeros_mask before false means two ecgs are present
+
+                # Use the mask to inform the model about second ecg presence
+                # Concatenate features with a separator embedding
+                batch_size = selected_ecg_feature.size(0)
+                sep_expanded = self.sep_embedding.unsqueeze(0).expand(batch_size, 1, -1)
+
+                # Concatenate along the sequence dimension
+                ecg_concat = torch.cat([
+                    selected_ecg_feature,
+                    sep_expanded,                  
+                    selected_ecg_feature2
+                ], dim=1)
+
+                # Incorporate the presence mask as an additional feature dimension
+                # Expand and append to the concatenated features
+                presence_mask_expanded = presence_mask.expand(-1, ecg_concat.size(1), 1)  # Expand to match concatenated feature shape
+                ecg_concat_with_mask = torch.cat([ecg_concat, presence_mask_expanded], dim=-1)  # Concatenate as a new feature dimension
+
+                # Pass concatenated features with the mask to the projector
+                ecg_features = self.multi_modal_projector(ecg_concat_with_mask)
+                inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
+                    ecg_features, inputs_embeds, input_ids, attention_mask, labels
+                )
+                if labels is None:
+                    labels = torch.full_like(attention_mask, self.config.ignore_index).to(torch.long)
+
 
             # In case input_ids.shape[1] == 1 & pixel_values==None & past_key_values != None, we are in the case of
             # generation with cache
-            elif past_key_values is not None and pixel_values is not None and input_ids.shape[1] == 1:
-                # Retrieve the first layer to inspect the logits and mask out the hidden states
-                # that are set to 0
-                first_layer_past_key_value = past_key_values[0][0][:, :, :, 0]
+            # elif past_key_values is not None and pixel_values is not None and input_ids.shape[1] == 1:
+            #     # Retrieve the first layer to inspect the logits and mask out the hidden states
+            #     # that are set to 0
+            #     # that are set to 0
+            #     first_layer_past_key_value = past_key_values[0][0][:, :, :, 0]
 
-                # Sum all dimensions of head_dim (-2) to avoid random errors such as: https://github.com/huggingface/transformers/pull/28032#issuecomment-1863691941
-                batch_index, non_attended_tokens = torch.where(first_layer_past_key_value.float().sum(-2) == 0)
+            #     # Sum all dimensions of head_dim (-2) to avoid random errors such as: https://github.com/huggingface/transformers/pull/28032#issuecomment-1863691941
+            #     batch_index, non_attended_tokens = torch.where(first_layer_past_key_value.float().sum(-2) == 0)
 
-                # Get the target length
-                target_length = input_ids.shape[1]
-                past_length = first_layer_past_key_value.shape[-1]
+            #     # Get the target length
+            #     target_length = input_ids.shape[1]
+            #     past_length = first_layer_past_key_value.shape[-1]
 
-                extended_attention_mask = torch.ones(
-                    (attention_mask.shape[0], past_length),
-                    dtype=attention_mask.dtype,
-                    device=attention_mask.device,
-                )
+            #     extended_attention_mask = torch.ones(
+            #         (attention_mask.shape[0], past_length),
+            #         dtype=attention_mask.dtype,
+            #         device=attention_mask.device,
+            #     )
 
-                # Filter out only the tokens that can be un-attended, this can happen
-                # if one uses Llava + Fused modules where the cache on the
-                # first iteration is already big enough, or if one passes custom cache
-                valid_indices = non_attended_tokens < extended_attention_mask.size(-1)
-                new_batch_index = batch_index[valid_indices]
-                new_non_attended_tokens = non_attended_tokens[valid_indices]
+            #     # Filter out only the tokens that can be un-attended, this can happen
+            #     # if one uses Llava + Fused modules where the cache on the
+            #     # first iteration is already big enough, or if one passes custom cache
+            #     valid_indices = non_attended_tokens < extended_attention_mask.size(-1)
+            #     new_batch_index = batch_index[valid_indices]
+            #     new_non_attended_tokens = non_attended_tokens[valid_indices]
 
-                # Zero-out the places where we don't need to attend
-                extended_attention_mask[new_batch_index, new_non_attended_tokens] = 0
+            #     # Zero-out the places where we don't need to attend
+            #     extended_attention_mask[new_batch_index, new_non_attended_tokens] = 0
 
-                attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
-                position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
+            #     attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
+            #     position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
 
         outputs = self.language_model(
             attention_mask=attention_mask,
@@ -382,3 +508,7 @@ class MultimodalLlamaForConditionalGeneration(PreTrainedModel):
             }
         )
         return model_inputs
+
+    def can_generate(self) -> bool:
+        """Whether this model can generate."""
+        return True
