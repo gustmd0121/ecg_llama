@@ -4,12 +4,15 @@ Main entrypoint for training the language-vision model.
 
 import argparse
 import os
-# os.environ['CUDA_VISIBLE_DEVICES']='7'
+# os.environ['CUDA_VISIBLE_DEVICES']='2'
+# os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'DETAIL'
 import pathlib
 import sys
 import logging
 from transformers import TrainingArguments
 import torch 
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from dataset.data_handling import create_dataset
 from model.model_utils import build_model
 from utils.utils import get_available_device, set_seed, make_save_folder
@@ -38,8 +41,8 @@ if __name__ == '__main__':
 
     parser.add_argument('--data_paths',
                         nargs='+',
-                        default=['/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_ecg_signals/', '/nfs_edlab/hschung/mimic_ecg_mapping/paraphrased_ecg_signals/'],
-                        choices=[['/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_ecg_signals/', '/nfs_edlab/hschung/mimic_ecg_mapping/paraphrased_ecg_signals/'],["/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_hf_ecg_images/", "/nfs_edlab/hschung/mimic_ecg_mapping/paraphrased_hf_ecg_images/"]],
+                        default=["/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_hf_ecg_spectrogram_images/", "/nfs_edlab/hschung/mimic_ecg_mapping/paraphrased_hf_ecg_spectrogram_images/"],
+                        choices=[['/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_ecg_signals/', '/nfs_edlab/hschung/mimic_ecg_mapping/paraphrased_ecg_signals/'],["/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_hf_ecg_images/", "/nfs_edlab/hschung/mimic_ecg_mapping/paraphrased_hf_ecg_images/"],["/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_hf_ecg_spectrogram_images/", "/nfs_edlab/hschung/mimic_ecg_mapping/paraphrased_hf_ecg_spectrogram_images/"]],
                         help='List of paths to directories containing train and valid subdirectories with JSON files')
 
     parser.add_argument('--checkpoint_save_path',
@@ -58,7 +61,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--max_eval_samples',
                         type=int,
-                        default=4000,
+                        default=2000,
                         help='Maximum number of samples to use for evaluation. Using 384 samples '
                              'provides 95% confidence level with 5% margin of error')
 
@@ -72,10 +75,19 @@ if __name__ == '__main__':
                        default=-1,
                        help='Number of GPUs to use (-1 for all available)')
     
-    parser.add_argument('--data_type', default='signal', choices=['image', 'signal'])
-
+    parser.add_argument('--data_type', default='image', choices=['image', 'signal'])
+    
     args = parser.parse_args(sys.argv[1:])
     logging.info(f"Parameters received: {args}")
+
+    if args.num_gpus > 1:
+        # Initialize process group
+        dist.init_process_group(backend='nccl')
+        local_rank = int(os.environ.get("LOCAL_RANK", -1))
+        torch.cuda.set_device(local_rank)
+        device = torch.device('cuda', local_rank)
+    else:
+        device = get_available_device()
 
     # Reproducibility
     set_seed()
@@ -83,13 +95,23 @@ if __name__ == '__main__':
     logging.info("Building model stack...")
     model_stack = build_model(text_model_id=args.text_model_id,
                               vision_model_id=args.vision_model_id,
-                              freeze_vision_model=True,
+                              freeze_vision_model=False,
                               freeze_language_model=False,
                               freeze_multimodal_projector=False,
-                              device=get_available_device(),
+                              device=device,
                               use_bfloat16=not args.load_in_8bit,  # Don't use bf16 with 8-bit
                               load_in_8bit=args.load_in_8bit,
-                              data_type=args.data_type)
+                              data_type=args.data_type,
+                              )
+
+    if args.num_gpus > 1:
+        model_stack['model'] = DDP(
+            model_stack['model'],
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,  # Enable finding unused parameters
+            broadcast_buffers=False  # Disable broadcasting buffers for better performance
+        )
 
     logging.info("Building data module...")
     data_module = create_dataset(tokenizer=model_stack['tokenizer'],
@@ -128,11 +150,10 @@ if __name__ == '__main__':
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         report_to=args.report_to,
-        # Add distributed training args
-        ddp_find_unused_parameters=False,
         max_grad_norm=1.0,
-        local_rank=int(os.environ.get("LOCAL_RANK", -1)),
-        deepspeed=None  # Can add DeepSpeed config if needed
+        local_rank=local_rank if args.num_gpus > 1 else -1,
+        deepspeed=None,  # Can add DeepSpeed config if needed
+        ddp_find_unused_parameters=True,  # Add this line
     )
 
     if training_args.gradient_checkpointing:

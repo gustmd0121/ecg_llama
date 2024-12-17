@@ -210,7 +210,7 @@ class DataCollatorForSupervisedDataset(object):
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
 
-        if ecg is None: 
+        if ecg is None or any(e is None for e in ecg): 
             batch['pixel_values'] = torch.stack(image)
             processed_image2 = [i if i is not None else torch.zeros((3, 224, 224)) for i in image2]
             batch['images2'] = torch.stack(processed_image2)
@@ -239,4 +239,3 @@ class DataCollatorForSupervisedDataset(object):
         
             
         return batch
-

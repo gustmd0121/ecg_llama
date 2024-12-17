@@ -26,7 +26,11 @@ class MultimodalLlamaForConditionalGeneration(PreTrainedModel, GenerationMixin):
         
         self.config = config
         # Change from (16, 1, 1024) to (1, 1024) - single separator vector
-        self.sep_embedding = nn.Parameter(torch.zeros(1, self.config.vision_config['hidden_size'], dtype=self.model_dtype))
+        try:
+            if self.config.vision_config.hidden_size:
+                self.sep_embedding = nn.Parameter(torch.zeros(1, self.config.vision_config.hidden_size, dtype=self.model_dtype))
+        except AttributeError:
+            self.sep_embedding = nn.Parameter(torch.zeros(1, self.config.vision_config['hidden_size'], dtype=self.model_dtype))
 
         # Configure quantization
         quantization_config = None
