@@ -4,7 +4,7 @@ Main entrypoint for training the language-vision model.
 
 import argparse
 import os
-# os.environ['CUDA_VISIBLE_DEVICES']='2'
+os.environ['CUDA_VISIBLE_DEVICES']='2'
 # os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'DETAIL'
 import pathlib
 import sys
@@ -17,6 +17,7 @@ from dataset.data_handling import create_dataset
 from model.model_utils import build_model
 from utils.utils import get_available_device, set_seed, make_save_folder
 from trainer_llama import MultimodalLlamaTrainer
+import json
 
 torch.set_num_threads(32)
 
@@ -49,11 +50,28 @@ def run_inference(model, tokenizer, data_module, device, model_path):
     results = []
     for batch in data_module['eval_dataset']:
         inputs = {
-            "input_ids": batch["input_ids"].to(device),
-            "pixel_values": batch["pixel_values"].to(device),
-            "attention_mask": batch["attention_mask"].to(device)
+            "input_ids": batch[0]["input_ids"].unsqueeze(0).to(device),
+            "labels": batch[0]["labels"].to(device)
         }
-
+        
+        if batch[0].get("image") is not None:
+            inputs["pixel_values"] = batch[0]["image"].unsqueeze(0).to(device)
+        if batch[0].get("image2") is not None:
+            inputs["images2"] = batch[0]["image2"].unsqueeze(0).to(device)
+        else:
+            inputs["images2"] = torch.zeros((1, 3, 224, 224)).to(device)
+            
+        if batch[0].get("ecg") is not None:
+            is_zero_sample1 = (batch[0]['ecg'].unsqueeze(0).sum(dim=(1, 2)) == 0)
+            inputs["ecg"] = batch[0]["ecg"].unsqueeze(0).to(device)
+            inputs["ecg_padding_mask"] = is_zero_sample1.unsqueeze(1).unsqueeze(2).expand(batch[0]['ecg'].unsqueeze(0).size()).clone()
+        if batch[0].get("ecg2") is not None:
+            inputs["ecg2"] = batch[0]["ecg2"].unsqueeze(0).to(device)
+            inputs["ecg_padding_mask2"] = inputs["ecg_padding_mask"]
+        else:
+            inputs["ecg2"] = torch.zeros((1, 12, 5000)).to(device)
+            inputs["ecg_padding_mask2"] = inputs["ecg_padding_mask"]
+        
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
@@ -64,8 +82,17 @@ def run_inference(model, tokenizer, data_module, device, model_path):
                 pad_token_id=tokenizer.pad_token_id
             )
         
-        decoded_outputs = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        results.extend(decoded_outputs)
+        response = tokenizer.decode(outputs[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        
+        if batch[0].get('conversation') is not None:
+            conversation = batch[0]['conversation']
+            question = next((item['value'] for item in conversation if item['from'] == 'human'), None)
+            answer = next((item['value'] for item in conversation if item['from'] == 'gpt'), None)
+            results.append({
+            'question': question,
+            'answer': answer,
+            'response': response
+            })
 
     return results
 
@@ -86,7 +113,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--data_paths',
                         nargs='+',
-                        default=["/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_hf_ecg_images/", "/nfs_edlab/hschung/mimic_ecg_mapping/paraphrased_hf_ecg_images/"],
+                        default=['/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_ecg_signals/', '/nfs_edlab/hschung/mimic_ecg_mapping/paraphrased_ecg_signals/'],
                         choices=[['/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_ecg_signals/', '/nfs_edlab/hschung/mimic_ecg_mapping/paraphrased_ecg_signals/'],["/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_hf_ecg_images/", "/nfs_edlab/hschung/mimic_ecg_mapping/paraphrased_hf_ecg_images/"],["/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_hf_ecg_spectrogram_images/", "/nfs_edlab/hschung/mimic_ecg_mapping/paraphrased_hf_ecg_spectrogram_images/"]],
                         help='List of paths to directories containing train and valid subdirectories with JSON files')
 
@@ -106,7 +133,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--max_eval_samples',
                         type=int,
-                        default=2000,
+                        default=100,
                         help='Maximum number of samples to use for evaluation. Using 384 samples '
                              'provides 95% confidence level with 5% margin of error')
 
@@ -120,12 +147,12 @@ if __name__ == '__main__':
                        default=-1,
                        help='Number of GPUs to use (-1 for all available)')
     
-    parser.add_argument('--data_type', default='image', choices=['image', 'signal'])
+    parser.add_argument('--data_type', default='signal', choices=['image', 'signal'])
     
     parser.add_argument('--inference', default=True)
     
     parser.add_argument('--model_path',
-                        default="/nfs_edlab/hschung/ecg_llama/clip_frozen_image_with_presence_mask/final_model/",
+                        default="/home/hschung/ecg-llm/llama-multimodal-vqa/src/model_checkpoints/w2v_cmsc_rlm_unfrozen_with_presence_mask/final_model",
                         help='Path to the pretrained model weights')
     
     args = parser.parse_args(sys.argv[1:])
@@ -231,3 +258,9 @@ if __name__ == '__main__':
         logging.info("Running inference...")
         results = run_inference(model_stack['model'], model_stack['tokenizer'], data_module, device, args.model_path)
         logging.info(f"Inference results: {results}")
+
+        # Save the inference results to a file
+        results_file = os.path.join(output_dir, "inference_results.json")
+        with open(results_file, 'w') as f:
+            json.dump(results, f, indent=4)
+        logging.info(f"Inference results saved to {results_file}")

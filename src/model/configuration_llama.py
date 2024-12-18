@@ -82,5 +82,5 @@ class MultimodalLlamaConfig(PretrainedConfig):
             self.vision_config = vision_config
         else:
             # remember to hf_donwload the .pt and yaml file of the mimic_iv_ecg_physionet_pretrained model <important>
-            with open(os.path.join('/home/hschung/ecg-llm/ecg_llama', 'ckpts', 'mimic_iv_ecg_physionet_pretrained.json'), 'r') as file:
+            with open(os.path.join(os.path.dirname(__file__), '..', '..', 'ckpts', 'mimic_iv_ecg_physionet_pretrained.json'), 'r') as file:
                 self.vision_config = json.load(file)

@@ -183,6 +183,8 @@ class SupervisedDataset(Dataset):
             data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
             data_dict['image2'] = None
 
+        data_dict["conversation"] = sources[0]
+
         return data_dict, data_dict['image2']
 
 

@@ -66,7 +66,7 @@ class MultimodalLlamaForConditionalGeneration(PreTrainedModel, GenerationMixin):
                 self.vision_model = self.vision_model.vision_model
         elif config.data_type == "signal":
             self.vision_model = build_model_from_checkpoint(
-                '/home/hschung/ecg-llm/ecg_llama/ckpts/mimic_iv_ecg_physionet_pretrained.pt'
+            os.path.join(os.path.dirname(__file__), '../../ckpts/mimic_iv_ecg_physionet_pretrained.pt')
             ).to(config.device).to(self.model_dtype)
 
         # Instantiate the multimodal projector
@@ -239,6 +239,7 @@ class MultimodalLlamaForConditionalGeneration(PreTrainedModel, GenerationMixin):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        inference: Optional[bool] = None
     ) -> Union[Tuple, LlavaCausalLMOutputWithPast]:
         r"""
         Args:
@@ -373,7 +374,7 @@ class MultimodalLlamaForConditionalGeneration(PreTrainedModel, GenerationMixin):
 
                 # Incorporate the presence mask as an additional feature dimension
                 # Expand and append to the concatenated features
-                presence_mask_expanded = presence_mask.expand(-1, ecg_concat.size(1), 1)  # Expand to match concatenated feature shape
+                presence_mask_expanded = presence_mask.expand(-1, ecg_concat.size(1), 1).to(device)  # Expand to match concatenated feature shape
                 ecg_concat_with_mask = torch.cat([ecg_concat, presence_mask_expanded], dim=-1)  # Concatenate as a new feature dimension
 
                 # Pass concatenated features with the mask to the projector
@@ -431,6 +432,9 @@ class MultimodalLlamaForConditionalGeneration(PreTrainedModel, GenerationMixin):
         )
 
         logits = outputs[0]
+        
+        if inference:
+            return outputs
 
         loss = None
         if labels is not None:
@@ -461,7 +465,14 @@ class MultimodalLlamaForConditionalGeneration(PreTrainedModel, GenerationMixin):
         )
 
     def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, inputs_embeds=None, pixel_values=None, attention_mask=None, **kwargs
+        self, 
+        input_ids, 
+        past_key_values=None, 
+        inputs_embeds=None, 
+        pixel_values=None, 
+        images2=None,  # Include images2 here
+        attention_mask=None, 
+        **kwargs
     ):
         if past_key_values is not None:
             if isinstance(past_key_values, Cache):
@@ -471,37 +482,28 @@ class MultimodalLlamaForConditionalGeneration(PreTrainedModel, GenerationMixin):
                 cache_length = past_length = past_key_values[0][0].shape[2]
 
             # Keep only the unprocessed tokens:
-            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
-            # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
-            # input)
             if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
-                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
-            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
-            # input_ids based on the past_length.
+                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length):]
             elif past_length < input_ids.shape[1]:
                 input_ids = input_ids[:, past_length:]
-            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
             elif self.config.image_token_index in input_ids:
-                input_ids = input_ids[:, input_ids.shape[1] - 1 :]
-            # If the cache has seen more tokens than it can hold, then the cache has a size limit. Let's discard the
-            # older attention values, as their corresponding values are not part of the input.
+                input_ids = input_ids[:, input_ids.shape[1] - 1:]
             if cache_length < past_length and attention_mask is not None:
-                attention_mask = attention_mask[:, -(cache_length + input_ids.shape[1]) :]
+                attention_mask = attention_mask[:, -(cache_length + input_ids.shape[1]):]
 
         position_ids = kwargs.get("position_ids", None)
         if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
             if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1] :]
+                position_ids = position_ids[:, -input_ids.shape[1]:]
 
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and past_key_values is None:
             model_inputs = {"inputs_embeds": inputs_embeds}
         else:
             model_inputs = {"input_ids": input_ids}
 
+        # Update model inputs to include images2
         model_inputs.update(
             {
                 "position_ids": position_ids,
@@ -509,9 +511,19 @@ class MultimodalLlamaForConditionalGeneration(PreTrainedModel, GenerationMixin):
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
                 "pixel_values": pixel_values,
+                "images2": images2,  # Add images2 to model inputs
             }
         )
+        
+        if 'ecg' in kwargs:
+            model_inputs['ecg'] = kwargs['ecg']
+            model_inputs['ecg_padding_mask'] = kwargs['ecg_padding_mask']
+        if 'ecg2' in kwargs:
+            model_inputs['ecg2'] = kwargs['ecg2']
+            model_inputs['ecg_padding_mask2'] = kwargs['ecg_padding_mask2']
+        
         return model_inputs
+
 
     def can_generate(self) -> bool:
         """Whether this model can generate."""
