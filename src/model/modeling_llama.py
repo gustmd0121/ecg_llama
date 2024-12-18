@@ -66,7 +66,7 @@ class MultimodalLlamaForConditionalGeneration(PreTrainedModel, GenerationMixin):
                 self.vision_model = self.vision_model.vision_model
         elif config.data_type == "signal":
             self.vision_model = build_model_from_checkpoint(
-                '/home/hschung/ecg-llm/llama-multimodal-vqa/ckpts/mimic_iv_ecg_physionet_pretrained.pt'
+                '/home/hschung/ecg-llm/ecg_llama/ckpts/mimic_iv_ecg_physionet_pretrained.pt'
             ).to(config.device).to(self.model_dtype)
 
         # Instantiate the multimodal projector

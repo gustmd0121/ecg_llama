@@ -25,6 +25,51 @@ logging.basicConfig(level=logging.INFO,
                     format=f'[{__name__}:%(levelname)s] %(message)s')
 
 
+def run_inference(model, tokenizer, data_module, device, model_path):
+    """
+    Perform inference with a trained model.
+
+    Args:
+        model: Placeholder for the model (not needed for loading from disk).
+        tokenizer: The tokenizer to decode outputs.
+        data_module: Data module containing the test dataset.
+        device: The device to run the inference on.
+        model_path: Path to the saved Hugging Face model.
+
+    Returns:
+        List of inference results.
+    """
+    # Load the model from the saved directory
+    model = model.from_pretrained(args.model_path).to(device)
+    model.eval()
+
+    # Load the tokenizer from the saved directory
+    tokenizer = tokenizer.from_pretrained(args.model_path)
+
+    results = []
+    for batch in data_module['eval_dataset']:
+        inputs = {
+            "input_ids": batch["input_ids"].to(device),
+            "pixel_values": batch["pixel_values"].to(device),
+            "attention_mask": batch["attention_mask"].to(device)
+        }
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                num_beams=1,
+                max_new_tokens=50,
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id
+            )
+        
+        decoded_outputs = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        results.extend(decoded_outputs)
+
+    return results
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--text_model_id',
@@ -41,7 +86,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--data_paths',
                         nargs='+',
-                        default=["/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_hf_ecg_spectrogram_images/", "/nfs_edlab/hschung/mimic_ecg_mapping/paraphrased_hf_ecg_spectrogram_images/"],
+                        default=["/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_hf_ecg_images/", "/nfs_edlab/hschung/mimic_ecg_mapping/paraphrased_hf_ecg_images/"],
                         choices=[['/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_ecg_signals/', '/nfs_edlab/hschung/mimic_ecg_mapping/paraphrased_ecg_signals/'],["/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_hf_ecg_images/", "/nfs_edlab/hschung/mimic_ecg_mapping/paraphrased_hf_ecg_images/"],["/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_hf_ecg_spectrogram_images/", "/nfs_edlab/hschung/mimic_ecg_mapping/paraphrased_hf_ecg_spectrogram_images/"]],
                         help='List of paths to directories containing train and valid subdirectories with JSON files')
 
@@ -51,11 +96,11 @@ if __name__ == '__main__':
 
     parser.add_argument("--batch_size",
                         type=int,
-                        default=26,
+                        default=1,
                         help="The batch size to use for training. Default: 16")
 
     parser.add_argument('--report_to',
-                        default='wandb',
+                        default='none',
                         choices=['wandb', 'none'],
                         help='Which reporting tool to use. Options: wandb, none. Default: none')
 
@@ -76,6 +121,12 @@ if __name__ == '__main__':
                        help='Number of GPUs to use (-1 for all available)')
     
     parser.add_argument('--data_type', default='image', choices=['image', 'signal'])
+    
+    parser.add_argument('--inference', default=True)
+    
+    parser.add_argument('--model_path',
+                        default="/nfs_edlab/hschung/ecg_llama/clip_frozen_image_with_presence_mask/final_model/",
+                        help='Path to the pretrained model weights')
     
     args = parser.parse_args(sys.argv[1:])
     logging.info(f"Parameters received: {args}")
@@ -121,7 +172,8 @@ if __name__ == '__main__':
                                  image_folder="data/images",
                                  image_aspect_ratio="pad",
                                  config=model_stack['config'],
-                                 max_eval_samples=args.max_eval_samples)  # Add this parameter
+                                 max_eval_samples=args.max_eval_samples,
+                                 inference=args.inference)  # Add this parameter
 
     output_dir = make_save_folder(args.checkpoint_save_path)
     logging.info(f"Output dir is: {output_dir}")
@@ -166,11 +218,16 @@ if __name__ == '__main__':
                                      args=training_args,
                                      **data_module)
 
-    logging.info("Starting training...")
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
-    else:
-        trainer.train()
+    if not args.inference:
+        logging.info("Starting training...")
+        if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+            trainer.train(resume_from_checkpoint=True)
+        else:
+            trainer.train()
 
-    logging.info("Saving final model...")
-    trainer.save_model(os.path.join(output_dir, "final_model"))
+        logging.info("Saving final model...")
+        trainer.save_model(os.path.join(output_dir, "final_model"))
+    else:
+        logging.info("Running inference...")
+        results = run_inference(model_stack['model'], model_stack['tokenizer'], data_module, device, args.model_path)
+        logging.info(f"Inference results: {results}")

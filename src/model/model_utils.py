@@ -54,7 +54,7 @@ def build_model(text_model_id,
                                                     device=device,  # Pass device to config
                                                     local_rank=local_rank)  # Pass local_rank to config
         
-    multimodal_llama_model = MultimodalLlamaForConditionalGeneration(multimodal_llama_config)
+    multimodal_llama_model = MultimodalLlamaForConditionalGeneration(multimodal_llama_config).to(device)
 
     return dict(tokenizer=tokenizer,
                 model=multimodal_llama_model,

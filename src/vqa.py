@@ -3,7 +3,7 @@ Main entrypoint for Visual-Question Answering with a pretrained model
 Example run: python src/vqa.py --model_path="./model_checkpoints/04-23_18-53-28/checkpoint-1000" --testset_path="./data/testset.json"
 """
 import os 
-os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import argparse
 import sys
@@ -29,11 +29,11 @@ logging.basicConfig(level=logging.INFO,
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path',
-                        default="/home/hschung/ecg-llm/llama-multimodal-vqa/src/model_checkpoints/11-06_08-26-24/final_model",
+                        default="/nfs_edlab/hschung/ecg_llama/w2v_cmsc_rlm_frozen_with_presence_mask/final_model/",
                         help='Path to the pretrained model weights')
 
     parser.add_argument('--testset_path',
-                        default="/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_hf_ecg_images/test/00000.json",
+                        default="/nfs_edlab/hschung/ptbxl_ecg_mapping/paraphrased_ecg_signals/test/00000.json",
                         help='Path to the test set JSON file')
 
     args = parser.parse_args(sys.argv[1:])

@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import json
 import math
 import torch
@@ -20,11 +20,13 @@ import copy
 import random
 import csv
 
+torch.set_num_threads(32)
+
 device = "cuda"
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--model_path',
-                    default="/home/hschung/ecg-llm/llama-multimodal-vqa/src/model_checkpoints/clip_frozen_image/final_model",
+                    default="/nfs_edlab/hschung/ecg_llama/clip_frozen_image_with_presence_mask/final_model/",
                     help='Path to the pretrained model weights')
 parser.add_argument('--ecg_path',
                     default=["/home/edlab/hschung/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3/records500/02000/02485_hr", "/home/edlab/hschung/ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3/records500/04000/04849_hr"],
@@ -38,7 +40,7 @@ parser.add_argument('--user_question',
 parser.add_argument('--ecg_dataset',
                     default="ptbxl")
 parser.add_argument('--output_path',
-                    default="/home/hschung/llama-multimodal-vqa/evaluation/ptbxl_w2v_cmsc_encoder_llama3.1_unfrozen_with_template_ids.pt")
+                    default="/home/hschung/ecg-llm/ecg_llama/evaluation/clip_frozen_image_with_presence_mask_llama3.1_with_template_ids.pt")
 parser.add_argument('--seed', type=int, default=1, help='Random seed for reproducibility')
 parser.add_argument('--num_questions', type=int, default=100)
 parser.add_argument('--ecg_text', default=False, help='Use ECG text mode')
@@ -95,7 +97,7 @@ else:
     base_path = ["/nfs_edlab/hschung/output_mimic/mimic-iv-ecg/template/", "/nfs_edlab/hschung/output_mimic/mimic-iv-ecg/paraphrased/"]  
 
 # Load the dataset from the specified path
-dataset2 = torch.load('/home/hschung/ecg-llm/llama-multimodal-vqa/ptbxl_test_dataset_1018/ptbxl_test_questions_by_types.pt')
+dataset2 = torch.load('/home/hschung/ecg-llm/ecg_llama/ptbxl_test_dataset_1018/ptbxl_test_questions_by_types.pt')
 # dataset3 = torch.load('/home/hschung/llama-multimodal-vqa/ptbxl_test_dataset_1018/ptbxl_test_questions_by_template.pt')
 
 #tokenizer 
@@ -138,7 +140,7 @@ for question_type, questions in dataset2.items():
             prompt = conv.get_prompt()
             input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors='pt').unsqueeze(0)
 
-            attention_mask = (input_ids != tokenizer.pad_token_id).long()
+            attention_mask = (input_ids != tokenizer.pad_token_id).long().to(device)
             text_padding_mask = (input_ids_m3ae == tokenizer2.pad_token_id)
 
             ecg1, _ = wfdb.rdsamp(item['ecg_path'][0])
@@ -231,12 +233,12 @@ for question_type, questions in dataset2.items():
             prompt = conv.get_prompt()
             
             input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors='pt').unsqueeze(0)
-            attention_mask = (input_ids != tokenizer.pad_token_id).long()
+            attention_mask = (input_ids != tokenizer.pad_token_id).long().to(device)
 
             inputs = {
                 "input_ids": input_ids.to(device),
                 "pixel_values": stacked_images.to(device),
-                "attention_mask": attention_mask.to(device)
+                "attention_mask": attention_mask
             }
          
         # Generate the response
